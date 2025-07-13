@@ -1,0 +1,24 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: f6
+  region: us-west-2
+  version: "1.31"
+
+availabilityZones: ["us-west-2a","us-west-2b"]
+
+managedNodeGroups:
+- name: nodegroup
+  desiredCapacity: 2
+  instanceType: c5.large
+  ssh:
+    enableSsm: true
+
+# To enable all of the control plane logs, uncomment below:
+# cloudWatch:
+#  clusterLogging:
+#    enableTypes: ["*"]
+
+secretsEncryption:
+  keyARN: <specific kms key arn>

@@ -1,0 +1,119 @@
+# 使用 AWS Deep Learning Container 作为基础镜像，支持 Neuron SDK
+FROM 763104351884.dkr.ecr.us-west-2.amazonaws.com/pytorch-training-neuronx:2.1.2-neuronx-py310-sdk2.24.0-ubuntu20.04
+
+# 设置工作目录
+WORKDIR /app
+
+# 设置环境变量
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV NEURON_RT_NUM_CORES=1
+ENV NEURON_CC_FLAGS="--model-type=transformer"
+
+# 更新包管理器
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    git \
+    vim \
+    htop \
+    && rm -rf /var/lib/apt/lists/*
+
+# 升级 pip 和安装额外的 Python 包
+RUN pip install --upgrade pip
+RUN pip install \
+    matplotlib \
+    seaborn \
+    tqdm \
+    tensorboard \
+    wandb
+
+# 复制训练相关文件
+COPY model_updated.py /app/
+COPY train_updated.py /app/
+
+# 复制原始文件作为参考
+COPY model.py /app/model_original.py
+COPY train.py /app/train_original.py
+
+# 创建必要的目录
+RUN mkdir -p /app/MNIST_DATA_train
+RUN mkdir -p /app/checkpoints
+RUN mkdir -p /app/logs
+RUN mkdir -p /app/tensorboard_logs
+
+# 设置文件权限
+RUN chmod +x /app/*.py
+
+# 创建环境检查脚本
+RUN echo '#!/bin/bash\n\
+echo "=== Environment Check ==="\n\
+echo "Python version: $(python --version)"\n\
+echo "PyTorch version: $(python -c \"import torch; print(torch.__version__)\")"\n\
+echo "Torch XLA version: $(python -c \"import torch_xla; print(torch_xla.__version__)\" 2>/dev/null || echo \"Not available\")"\n\
+echo "Neuron CC version: $(neuron-cc --version 2>/dev/null || echo \"Not available\")"\n\
+echo "Available devices: $(python -c \"import torch_xla.core.xla_model as xm; print(xm.get_xla_supported_devices())\" 2>/dev/null || echo \"XLA not available\")"\n\
+echo "Current directory: $(pwd)"\n\
+echo "Files: $(ls -la)"\n\
+echo "========================"\n\
+' > /app/check_env.sh
+
+# 创建训练启动脚本
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
+echo "=== Starting Neuron Model Training ==="\n\
+\n\
+# 运行环境检查\n\
+/app/check_env.sh\n\
+\n\
+# 设置 Neuron 环境变量\n\
+export NEURON_RT_NUM_CORES=${NEURON_RT_NUM_CORES:-1}\n\
+export NEURON_CC_FLAGS=${NEURON_CC_FLAGS:-"--model-type=transformer"}\n\
+\n\
+echo "Neuron RT Cores: $NEURON_RT_NUM_CORES"\n\
+echo "Neuron CC Flags: $NEURON_CC_FLAGS"\n\
+echo ""\n\
+\n\
+# 运行训练\n\
+echo "Starting training with Neuron SDK 2.24.0..."\n\
+python train_updated.py\n\
+\n\
+echo ""\n\
+echo "=== Training Completed ==="\n\
+echo "Checkpoint location: $(ls -la checkpoints/ 2>/dev/null || echo \"No checkpoints found\")"\n\
+echo "Log files: $(ls -la logs/ 2>/dev/null || echo \"No logs found\")"\n\
+' > /app/run_training.sh
+
+# 创建推理脚本模板
+RUN echo '#!/bin/bash\n\
+echo "=== Model Inference ==="\n\
+echo "Loading trained model from checkpoints/"\n\
+python -c "\n\
+import torch\n\
+import torch_xla.core.xla_model as xm\n\
+from model_updated import MLP\n\
+\n\
+# Load checkpoint\n\
+checkpoint = torch.load(\"checkpoints/checkpoint.pt\", map_location=\"cpu\")\n\
+model = MLP()\n\
+model.load_state_dict(checkpoint[\"state_dict\"])\n\
+model.eval()\n\
+\n\
+print(\"Model loaded successfully!\")\n\
+print(f\"Model parameters: {sum(p.numel() for p in model.parameters())}\")\n\
+"\n\
+' > /app/run_inference.sh
+
+# 设置脚本权限
+RUN chmod +x /app/*.sh
+
+# 暴露端口
+EXPOSE 6006 8888
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD python -c "import torch; import torch_xla.core.xla_model as xm; print('Health check passed')" || exit 1
+
+# 默认命令
+CMD ["/app/run_training.sh"]

@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  neuron-training:
+    build:
+      context: .
+      dockerfile: Dockerfile.neuron
+    container_name: neuron-model-training
+    volumes:
+      # 挂载数据目录
+      - ./data:/app/MNIST_DATA_train
+      - ./checkpoints:/app/checkpoints
+      - ./logs:/app/logs
+      - ./tensorboard_logs:/app/tensorboard_logs
+    environment:
+      - NEURON_RT_NUM_CORES=1
+      - NEURON_CC_FLAGS=--model-type=transformer
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "6006:6006"  # TensorBoard
+      - "8888:8888"  # Jupyter (如果需要)
+    # 如果在 Neuron 实例上运行，需要设备访问权限
+    privileged: true
+    devices:
+      - /dev/neuron0:/dev/neuron0
+    command: /app/run_training.sh
+    
+  tensorboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.neuron
+    container_name: neuron-tensorboard
+    volumes:
+      - ./tensorboard_logs:/app/tensorboard_logs
+    ports:
+      - "6007:6006"
+    command: tensorboard --logdir=/app/tensorboard_logs --host=0.0.0.0 --port=6006
+    depends_on:
+      - neuron-training
+
+  # 可选：Jupyter notebook 服务
+  jupyter:
+    build:
+      context: .
+      dockerfile: Dockerfile.neuron
+    container_name: neuron-jupyter
+    volumes:
+      - .:/app/workspace
+      - ./checkpoints:/app/checkpoints
+    ports:
+      - "8889:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+    command: >
+      bash -c "pip install jupyterlab &&
+               jupyter lab --ip=0.0.0.0 --port=8888 --no-browser --allow-root --notebook-dir=/app"

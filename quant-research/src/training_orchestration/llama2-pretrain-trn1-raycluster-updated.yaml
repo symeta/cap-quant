@@ -1,0 +1,312 @@
+# This RayCluster configuration deploys a distributed training environment for updated model
+# using AWS Neuron SDK and RayTrain on Amazon EKS with JuiceFS storage.
+
+# ----------------------------------------------------------------------
+# NOTE: For detailed deployment instructions, refer to the DoEKS website (https://awslabs.github.io/data-on-eks/docs/category/training-on-eks).
+# ----------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# NOTE: This configuration uses JuiceFS dataset created by Fluid instead of FSx for Lustre.
+# Ensure that the JuiceFS dataset and runtime are properly deployed in the fluid-system namespace.
+# ----------------------------------------------------------------------
+
+# Docs for Volcano with KubeRay: https://docs.ray.io/en/master/cluster/kubernetes/k8s-ecosystem/volcano.html
+---
+apiVersion: scheduling.volcano.sh/v1beta1
+kind: Queue
+metadata:
+  name: updated-model-training-queue
+  namespace: default
+spec:
+  weight: 1
+  capability:
+    cpu: '500'
+    memory: 1500Gi
+
+---
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: kuberay-trn1-updated
+  namespace: default
+  labels:
+    ray.io/scheduler-name: volcano
+    volcano.sh/queue-name: updated-model-training-queue
+spec:
+  rayVersion: 2.22.0
+  headGroupSpec:
+    # Head Node Configuration
+    # This section defines the specification for the Ray head pod.
+    # The head node manages the cluster and provides services like the dashboard and GCS.
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: public.ecr.aws/data-on-eks/ray-pytorch-training-neuronx:latest # Replace with your Docker image URL
+            imagePullPolicy: Always # Pull the latest image each time
+            lifecycle:
+              preStop:
+                exec:
+                  command: ["/bin/sh", "-c", "ray stop"]  # Graceful shutdown of Ray processes
+            ports:
+              - containerPort: 8265
+                name: dashboard   # Expose Ray dashboard
+              - containerPort: 6379
+                name: redis       # Expose Redis port
+              - containerPort: 10001
+                name: object-manager # Expose object manager port
+            resources:
+              requests:
+                cpu: 6
+                memory: 30Gi
+            volumeMounts:
+              - mountPath: /tmp/ray
+                name: log-volume   # Mount for Ray logs
+              - name: juicefs-storage # Mount JuiceFS dataset
+                mountPath: /shared
+              - name: model-code # Mount updated model code
+                mountPath: /app/model
+            env:
+              - name: PYTHONPATH
+                value: "/app/model:$PYTHONPATH"
+        # Node Selector for Karpenter
+        # Karpenter will provision this head pod on a node with the specified labels.
+        nodeSelector:
+          instanceType: mixed-x86
+          provisionerType: Karpenter
+        volumes:
+          - name: log-volume
+            emptyDir: {}
+          - name: juicefs-storage
+            persistentVolumeClaim:
+              claimName: jfs-dataset   # Reference the JuiceFS PVC created by Fluid
+          - name: model-code
+            configMap:
+              name: updated-model-code
+    rayStartParams:
+      dashboard-host: 0.0.0.0    # Make dashboard accessible
+
+  workerGroupSpecs:
+    # Worker Node Configuration
+    # This section defines the specification for the Ray worker pods.
+    # Worker nodes execute tasks and participate in distributed training.
+    - groupName: workergroup
+      replicas: 2  # Number of worker replicas
+      minReplicas: 2 # Minimum number of worker replicas
+      maxReplicas: 2 # Maximum number of worker replicas (no scaling in this case)
+      rayStartParams: {}
+      template:
+        spec:
+          containers:
+            - name: ray-worker
+              image: public.ecr.aws/data-on-eks/ray-pytorch-training-neuronx:latest # Replace with your Docker image URL
+              imagePullPolicy: Always # Pull the latest image each time
+              lifecycle:
+                preStop:
+                  exec:
+                    command: ["/bin/sh", "-c", "ray stop"]
+              ports:
+                - containerPort: 8265
+                  name: dashboard
+                - containerPort: 6379
+                  name: redis
+                - containerPort: 10001
+                  name: object-manager
+              resources:
+                limits:
+                  aws.amazon.com/neuron: '16'  # Request AWS Neuron cores
+                  vpc.amazonaws.com/efa: '8'   # Request AWS EFA devices
+                  memory: 440Gi
+                requests:
+                  aws.amazon.com/neuron: '16'
+                  vpc.amazonaws.com/efa: '8'
+                  cpu: '120'
+                  memory: 440Gi
+              volumeMounts:
+                - name: juicefs-storage
+                  mountPath: /shared   # Mount JuiceFS dataset
+                - name: dshm
+                  mountPath: /dev/shm   # Mount for shared memory
+                - mountPath: /tmp/ray
+                  name: log-volume     # Mount for Ray logs
+                - name: model-code # Mount updated model code
+                  mountPath: /app/model
+              env:
+                - name: PYTHONPATH
+                  value: "/app/model:$PYTHONPATH"
+          # Node Selector for Managed Node Group (with Cluster Autoscaler)
+          # These workers will run on Trn1 instances provisioned by the cluster autoscaler.
+          # This is necessary as Karpenter doesn't currently support EFA (required for Neuron distributed training).
+          nodeSelector:
+            instance-type: trn1-32xl
+            provisioner: cluster-autoscaler
+
+          # Tolerations for Trn1 and Dedicated Nodes
+          tolerations:
+            - key: "aws.amazon.com/neuron"
+              operator: "Exists"
+              effect: "NoSchedule"
+            - key: "hub.jupyter.org/dedicated"
+              operator: "Equal"
+              value: "user"
+              effect: "NoSchedule"
+          volumes:
+            # Persistent Volume Claim (PVC) to access the JuiceFS dataset
+            - name: juicefs-storage
+              persistentVolumeClaim:
+                claimName: jfs-dataset
+            - name: dshm
+              emptyDir:
+                medium: Memory
+            - name: log-volume
+              emptyDir: {}
+            - name: model-code
+              configMap:
+                name: updated-model-code
+
+---
+# ConfigMap to store the updated model code
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: updated-model-code
+  namespace: default
+data:
+  model_updated.py: |
+    import torch.nn as nn
+    import torch.nn.functional as F
+
+    # Declare 3-layer MLP for MNIST dataset
+    # 针对 Neuron SDK 2.24.0 优化
+    class MLP(nn.Module):
+        def __init__(self, input_size = 28 * 28, output_size = 10, layers = [120, 84]):
+            super(MLP, self).__init__()
+            self.fc1 = nn.Linear(input_size, layers[0])
+            self.fc2 = nn.Linear(layers[0], layers[1])
+            self.fc3 = nn.Linear(layers[1], output_size)
+            
+            # 2.24.0 优化：添加 dropout 以提高泛化能力
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, x):
+            x = F.relu(self.fc1(x))
+            x = self.dropout(x)  # 在训练时应用 dropout
+            x = F.relu(self.fc2(x))
+            x = self.dropout(x)
+            x = self.fc3(x)
+            return F.log_softmax(x, dim=1)
+
+    # 2.24.0 新增：支持混合精度训练的模型版本
+    class MLPWithAMP(nn.Module):
+        def __init__(self, input_size = 28 * 28, output_size = 10, layers = [120, 84]):
+            super(MLPWithAMP, self).__init__()
+            self.fc1 = nn.Linear(input_size, layers[0])
+            self.fc2 = nn.Linear(layers[0], layers[1])
+            self.fc3 = nn.Linear(layers[1], output_size)
+            self.dropout = nn.Dropout(0.2)
+
+        def forward(self, x):
+            # 使用 autocast 进行混合精度计算 (2.24.0 支持)
+            x = F.relu(self.fc1(x))
+            x = self.dropout(x)
+            x = F.relu(self.fc2(x))
+            x = self.dropout(x)
+            x = self.fc3(x)
+            return F.log_softmax(x, dim=1)
+
+  train_updated.py: |
+    import os
+    import time
+    import torch
+    from model_updated import MLP
+
+    from torchvision.datasets import mnist
+    from torch.utils.data import DataLoader
+    from torchvision.transforms import ToTensor
+
+    # XLA imports - 更新到 2.24.0
+    import torch_xla.core.xla_model as xm
+    import torch_xla.distributed.parallel_loader as pl
+    import torch_xla.debug.metrics as met
+
+    # Global constants
+    EPOCHS = 4
+    WARMUP_STEPS = 2
+    BATCH_SIZE = 32
+
+    # Load MNIST train dataset from JuiceFS shared storage
+    train_dataset = mnist.MNIST(root='/shared/MNIST_DATA_train',
+                                train=True, download=True, transform=ToTensor())
+
+    def main():
+        # Prepare data loader
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
+        
+        # XLA: 使用 ParallelLoader 以获得更好的性能 (2.24.0 推荐)
+        para_loader = pl.ParallelLoader(train_loader, [xm.xla_device()])
+        train_loader = para_loader.per_device_loader(xm.xla_device())
+
+        # Fix the random number generator seeds for reproducibility
+        torch.manual_seed(0)
+
+        # XLA: 更明确的设备指定方式 (2.24.0)
+        device = xm.xla_device()
+        print(f"Using device: {device}")
+
+        # Move model to device and declare optimizer and loss function
+        model = MLP().to(device)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        loss_fn = torch.nn.NLLLoss()
+
+        # Run the training loop
+        print('----------Training ---------------')
+        model.train()
+        for epoch in range(EPOCHS):
+            start = time.time()
+            for idx, (train_x, train_label) in enumerate(train_loader):
+                optimizer.zero_grad()
+                train_x = train_x.view(train_x.size(0), -1)
+                train_x = train_x.to(device)
+                train_label = train_label.to(device)
+                output = model(train_x)
+                loss = loss_fn(output, train_label)
+                loss.backward()
+                optimizer.step()
+                
+                # XLA: mark_step 在 2.24.0 中保持不变，但建议添加更多调试信息
+                xm.mark_step()
+                
+                if idx < WARMUP_STEPS: # skip warmup iterations
+                    start = time.time()
+
+            # 2.24.0 新增：打印每个 epoch 的指标
+            print(f"Epoch {epoch + 1}/{EPOCHS} completed")
+            
+            # 可选：打印 XLA 编译指标 (2.24.0 新功能)
+            if epoch == 0:  # 只在第一个 epoch 后打印
+                print("XLA compilation metrics:")
+                print(met.short_metrics_report())
+
+        # Compute statistics for the last epoch
+        interval = idx - WARMUP_STEPS # skip warmup iterations
+        throughput = interval / (time.time() - start)
+        print("Train throughput (iter/sec): {}".format(throughput))
+        print("Final loss is {:0.4f}".format(loss.detach().to('cpu')))
+
+        # Save checkpoint to JuiceFS shared storage
+        os.makedirs("/shared/checkpoints", exist_ok=True)
+        checkpoint = {'state_dict': model.state_dict()}
+        
+        # XLA: 在 2.24.0 中，xm.save 的使用方式保持不变
+        # 但建议先同步所有设备
+        xm.wait_device_ops()  # 2.24.0 推荐：确保所有操作完成
+        xm.save(checkpoint,'/shared/checkpoints/checkpoint.pt')
+
+        print('----------End Training ---------------')
+        
+        # 2.24.0 新增：最终的指标报告
+        print("Final XLA metrics:")
+        print(met.short_metrics_report())
+
+    if __name__ == '__main__':
+        main()

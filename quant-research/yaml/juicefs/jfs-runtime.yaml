@@ -1,0 +1,13 @@
+apiVersion: data.fluid.io/v1alpha1
+kind: JuiceFSRuntime
+metadata:
+  name: jfs-dataset
+  namespace: fluid-system
+spec:
+  replicas: 1
+  tieredstore:
+    levels:
+      - mediumtype: MEM
+        path: /dev/shm
+        quota: "1Gi"
+        low: "0.1"

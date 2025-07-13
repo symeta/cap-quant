@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jfs-reader-pod
+spec:
+  containers:
+    - name: demo
+      image: busybox
+      command: ["/bin/sh"]
+      args: ["-c", "while true; do ls -la /data; sleep 30; done"]
+      volumeMounts:
+        - name: jfs-data
+          mountPath: /data
+  volumes:
+    - name: jfs-data
+      persistentVolumeClaim:
+        claimName: jfs-dataset
