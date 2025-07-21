@@ -5,10 +5,10 @@ metadata:
   namespace: fluid-system
 spec:
   mounts:
-    - mountPoint: "juicefs:///demo"  # JuiceFS 挂载点
+    - mountPoint: "juicefs:///"  # JuiceFS 挂载点
       name: juicefs-mount
       options:
-        bucket: "https://ab-23-data.us-west-2.s3.amazonaws.com"      # 可选，如果与 Secret 中的不同
+        bucket: "https://training-data-bkt.us-west-2.s3.amazonaws.com"      # 可选，如果与 Secret 中的不同
       encryptOptions:
         - name: metaurl
           valueFrom:
